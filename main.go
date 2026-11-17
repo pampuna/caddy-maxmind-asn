@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -31,14 +32,19 @@ func init() {
 	caddy.RegisterModule(MaxmindASN{})
 }
 
-// Allows to filter requests based on source IP ASO.
+// Allows to filter requests based on source IP ASN or ASO.
 type MaxmindASN struct {
 	// The path of the MaxMind GeoLite2-ASN.mmd file
 	DbPath string `json:"db_path"`
 
 	// A list of
-	AllowASOs []string `json:"allow_asos"`
-	DenyASOs  []string `json:"deny_asos"`
+	AllowASOs []string `json:"allow_asos,omitempty"`
+	DenyASOs  []string `json:"deny_asos,omitempty"`
+
+	// AS numbers (exact match). Accepts comma-separated values
+	// and an optional "AS" prefix, e.g. 1103,1136 or AS1136.
+	AllowASNs []int `json:"allow_asns,omitempty"`
+	DenyASNs  []int `json:"deny_asns,omitempty"`
 
 	// MaxMind database reader
 	dbInst *maxminddb.Reader
@@ -56,6 +62,10 @@ func (m *MaxmindASN) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				current = 2
 			case "deny_asos":
 				current = 3
+			case "allow_asns":
+				current = 4
+			case "deny_asns":
+				current = 5
 			default:
 				switch current {
 				case 1:
@@ -65,6 +75,18 @@ func (m *MaxmindASN) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					m.AllowASOs = append(m.AllowASOs, strings.ToLower(d.Val()))
 				case 3:
 					m.DenyASOs = append(m.DenyASOs, strings.ToLower(d.Val()))
+				case 4:
+					asns, err := parseASNs(d.Val())
+					if err != nil {
+						return err
+					}
+					m.AllowASNs = append(m.AllowASNs, asns...)
+				case 5:
+					asns, err := parseASNs(d.Val())
+					if err != nil {
+						return err
+					}
+					m.DenyASNs = append(m.DenyASNs, asns...)
 				default:
 					return fmt.Errorf("unexpected config parameter %s", d.Val())
 				}
@@ -72,6 +94,28 @@ func (m *MaxmindASN) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 	}
 	return nil
+}
+
+// parseASNs turns one Caddyfile token into a list of AS numbers.
+// "1103,1136,1145" -> [1103, 1136, 1145]
+// "AS1136"         -> [1136]
+// Space-separated tokens ("allow_asns 1103 1136") are appended by
+// the parser loop itself, one call per token.
+func parseASNs(token string) ([]int, error) {
+	var asns []int
+	for _, raw := range strings.Split(token, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		raw = strings.TrimPrefix(strings.ToUpper(raw), "AS")
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n <= 0 || n > 4294967295 {
+			return nil, fmt.Errorf("invalid ASN %q", raw)
+		}
+		asns = append(asns, int(n))
+	}
+	return asns, nil
 }
 
 func (MaxmindASN) CaddyModule() caddy.ModuleInfo {
@@ -88,8 +132,13 @@ func (m *MaxmindASN) Provision(ctx caddy.Context) error {
 	if err != nil {
 		return fmt.Errorf("cannot open database file %s: %v", m.DbPath, err)
 	}
-
-	m.logger.Info("provisioned", zap.String("maxmind_db", m.DbPath), zap.Int("allowed_asos", len(m.AllowASOs)), zap.Int("denied_asos", len(m.DenyASOs)))
+	m.logger.Info("provisioned",
+		zap.String("maxmind_db", m.DbPath),
+		zap.Int("allowed_asos", len(m.AllowASOs)),
+		zap.Int("denied_asos", len(m.DenyASOs)),
+		zap.Int("allowed_asns", len(m.AllowASNs)),
+		zap.Int("denied_asns", len(m.DenyASNs)),
+	)
 	return nil
 }
 
@@ -100,9 +149,19 @@ func (m *MaxmindASN) Cleanup() error {
 	return nil
 }
 
-func (m *MaxmindASN) checkAllowed(asoresult string) bool {
-	if asoresult == "" {
-		return true
+func containsInt(list []int, v int) bool {
+	for _, i := range list {
+		if i == v {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *MaxmindASN) checkAllowed(asn int, asoresult string) bool {
+	// Deny lists take precedence over allow lists.
+	if len(m.DenyASNs) > 0 && containsInt(m.DenyASNs, asn) {
+		return false
 	}
 	if len(m.DenyASOs) > 0 {
 		for _, i := range m.DenyASOs {
@@ -112,10 +171,23 @@ func (m *MaxmindASN) checkAllowed(asoresult string) bool {
 		}
 		return true
 	}
-	if len(m.AllowASOs) > 0 {
-		for _, i := range m.AllowASOs {
-			if strings.Contains(asoresult, i) {
+
+	// Allow lists: pass if matched by either the ASN or the ASO list.
+	// Note: an allow_asns list matches on the exact number, so an IP
+	// without an ASN record in the database (private ranges, unknown
+	// space) does NOT pass, unlike allow_asos.
+	if len(m.AllowASNs) > 0 || len(m.AllowASOs) > 0 {
+		if len(m.AllowASNs) > 0 && containsInt(m.AllowASNs, asn) {
+			return true
+		}
+		if len(m.AllowASOs) > 0 {
+			if asoresult == "" {
 				return true
+			}
+			for _, i := range m.AllowASOs {
+				if strings.Contains(asoresult, i) {
+					return true
+				}
 			}
 		}
 		return false
@@ -124,8 +196,9 @@ func (m *MaxmindASN) checkAllowed(asoresult string) bool {
 }
 
 func (m *MaxmindASN) Match(r *http.Request) bool {
-	// If both the allow and deny fields are empty, let the request pass
-	if len(m.AllowASOs) < 1 && len(m.DenyASOs) < 1 {
+	// If no allow or deny fields are set, let the request pass
+	if len(m.AllowASOs) < 1 && len(m.DenyASOs) < 1 &&
+		len(m.AllowASNs) < 1 && len(m.DenyASNs) < 1 {
 		return false
 	}
 
@@ -157,9 +230,11 @@ func (m *MaxmindASN) Match(r *http.Request) bool {
 		zap.String("autonomous_system_organization", record.ASO),
 	)
 
-	// Check if the IP against the allowed/denied ASOs
-	if !m.checkAllowed(strings.ToLower(record.ASO)) {
-		m.logger.Debug("aso not allowed", zap.String("autonomous_system_organization", record.ASO))
+	// Check the IP against the allowed/denied ASNs and ASOs
+	if !m.checkAllowed(record.ASN, strings.ToLower(record.ASO)) {
+		m.logger.Debug("asn/aso not allowed",
+			zap.Int("autonomous_system_number", record.ASN),
+			zap.String("autonomous_system_organization", record.ASO))
 		return false
 	}
 
