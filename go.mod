@@ -1,4 +1,4 @@
-module github.com/lum8rjack/caddy-maxmind-asn
+module github.com/pampuna/caddy-maxmind-asn
 
 go 1.24.2
 
